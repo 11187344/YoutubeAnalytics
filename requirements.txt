@@ -1,6 +1,8 @@
 streamlit
 pandas
 plotly
-reportlab
 requests
-fpdf2
+reportlab
+google-genai
+anthropic
+youtube-transcript-api
