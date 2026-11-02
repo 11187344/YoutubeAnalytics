@@ -271,29 +271,99 @@ AI_SYSTEM = (
 HIDDEN_COLS = ["VideoID", "FullTitle", "Description", "Tags", "ThumbnailURL"]
 
 
-def resolve_anthropic_key(sidebar_value: str) -> str:
-    """Sidebar input wins, then .streamlit/secrets.toml, then the environment."""
+GEMINI_DEFAULT_MODEL = "gemini-flash-latest"   # alias that always points at the current Flash model
+
+
+def resolve_key(sidebar_value: str, *names: str) -> str:
+    """Sidebar input wins, then .streamlit/secrets.toml, then environment variables."""
     if sidebar_value:
         return sidebar_value.strip()
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        pass
-    return os.environ.get("ANTHROPIC_API_KEY", "")
+    for name in names:
+        try:
+            val = st.secrets[name]
+            if val:
+                return str(val)
+        except Exception:
+            pass
+        if os.environ.get(name):
+            return os.environ[name]
+    return ""
 
 
-def ask_claude(key: str, content, max_tokens: int = 1800) -> str:
-    """Send one user turn (a string or a list of content blocks) and return the text reply."""
+def ask_claude(key: str, content, max_tokens: int = 1800, model: str = AI_MODEL) -> str:
+    """Send one user turn (a string or a list of content blocks) to Claude and return the text."""
     if anthropic is None:
         raise RuntimeError("The 'anthropic' package is not installed. Run: pip install anthropic")
     client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
-        model=AI_MODEL,
+        model=model,
         max_tokens=max_tokens,
         system=AI_SYSTEM,
         messages=[{"role": "user", "content": content}],
     )
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+
+
+def ask_gemini(key: str, model: str, prompt: str, image_url: str = "",
+               video_url: str = "", json_mode: bool = False) -> str:
+    """Send one turn to Gemini. Can attach a thumbnail image and/or a public YouTube video URL."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("The 'google-genai' package is not installed. Run: pip install google-genai")
+
+    client = genai.Client(api_key=key)
+    parts = []
+    if video_url:   # Gemini can watch public YouTube videos directly
+        parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
+    if image_url:
+        img = requests.get(image_url, timeout=15)
+        img.raise_for_status()
+        parts.append(types.Part.from_bytes(
+            data=img.content, mime_type=img.headers.get("Content-Type", "image/jpeg")))
+    parts.append(types.Part(text=prompt))
+
+    config = types.GenerateContentConfig(
+        system_instruction=AI_SYSTEM,
+        response_mime_type="application/json" if json_mode else None,
+    )
+    resp = client.models.generate_content(
+        model=model, contents=types.Content(role="user", parts=parts), config=config)
+    return resp.text or ""
+
+
+def ask_ai(ai: dict, prompt: str, image_url: str = "", video_url: str = "",
+           json_mode: bool = False, max_tokens: int = 1800) -> str:
+    """Provider-agnostic entry point. `ai` = {"provider", "key", "model"}."""
+    if ai["provider"] == "Gemini":
+        return ask_gemini(ai["key"], ai["model"], prompt, image_url, video_url, json_mode)
+    blocks = [{"type": "text", "text": prompt}]
+    if image_url:
+        blocks.insert(0, {"type": "image", "source": {"type": "url", "url": image_url}})
+    return ask_claude(ai["key"], blocks, max_tokens, ai["model"])
+
+
+_FATAL_MARKERS = ("429", "resource_exhausted", "quota", "rate limit", "rate_limit",
+                  "api key", "api_key", "authentication", "401", "not installed")
+
+
+def _is_fatal_ai_error(e: Exception) -> bool:
+    """Errors where retrying with a lighter request won't help (quota, bad key, missing package)."""
+    msg = str(e).lower()
+    return any(m in msg for m in _FATAL_MARKERS)
+
+
+def friendly_ai_error(e: Exception) -> str:
+    msg = str(e)
+    low = msg.lower()
+    if "429" in low or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
+        return ("Rate/quota limit reached. On Gemini's free tier, per-minute limits clear after a short "
+                "wait and daily limits reset at midnight Pacific. Try again later, or pick a lighter model "
+                "(e.g. a Flash-Lite model) under 'Model settings'.")
+    if "api key" in low or "api_key" in low or "401" in low or "authentication" in low:
+        return "The API key was rejected. Check that you pasted the whole key for the selected provider."
+    return msg[:400]
 
 
 def parse_json_reply(text: str) -> dict:
@@ -363,14 +433,27 @@ def fetch_comments(api_key: str, video_id: str, max_results: int = 100):
     return comments, None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def review_video(anthropic_key: str, video_id: str, title: str, description: str, tags: str,
-                 thumb_url: str, views: int, likes: int, comments: int, published: str,
-                 avg_views: float, use_thumbnail: bool) -> dict:
-    """Structured AI review of one video (transcript + metadata + optional thumbnail)."""
-    transcript = fetch_transcript(video_id)
+def _review_prompt(title, description, tags, views, likes, comments, published, avg_views,
+                   watching: bool, transcript: str) -> str:
+    if watching:
+        source = ("You are given the video itself (audio and visuals). Judge the hook (first ~30 seconds), "
+                  "structure, pacing, visuals, editing and CTA from what you see and hear, and reference "
+                  "moments as [m:ss].")
+        null_rule = 'Use null for anything you cannot judge (e.g. "thumbnail" when no image is attached).'
+        transcript_block = ""
+    else:
+        source = "No video is attached. Judge the script from the transcript below."
+        null_rule = ('Use null for anything you cannot judge: hook/structure/cta when the transcript is '
+                     'unavailable, thumbnail when no image is attached.')
+        transcript_block = f"""
+TRANSCRIPT (timestamps in [m:ss]):
+<transcript>
+{transcript or '[unavailable]'}
+</transcript>
+"""
 
-    prompt = f"""Review this YouTube video for its creator.
+    return f"""Review this YouTube video for its creator.
+{source}
 
 VIDEO
 Title: {title}
@@ -382,12 +465,7 @@ Description (truncated):
 <description>
 {description[:1500]}
 </description>
-
-TRANSCRIPT (timestamps in [m:ss]):
-<transcript>
-{transcript or '[unavailable]'}
-</transcript>
-
+{transcript_block}
 Return ONLY a JSON object (no markdown fences) with exactly this shape:
 {{
   "scores": {{"hook": int|null, "structure": int|null, "title": int|null, "thumbnail": int|null, "cta": int|null}},
@@ -399,34 +477,55 @@ Return ONLY a JSON object (no markdown fences) with exactly this shape:
 }}
 Rules:
 - Scores are integers 1-10 and calibrated (5 = average, 8+ = genuinely strong).
-- Use null for anything you cannot judge: hook/structure/cta when the transcript is unavailable, thumbnail when no image is attached.
-- strengths / weaknesses: 2-4 short, specific items each; reference transcript timestamps where possible.
+- {null_rule}
+- strengths / weaknesses: 2-4 short, specific items each; reference timestamps where possible.
 - top_fixes: 3 concrete changes ordered by expected impact.
 - Relate the verdict to the video's performance versus the channel average where that is informative."""
 
-    use_image = bool(use_thumbnail and thumb_url)
-    blocks = [{"type": "text", "text": prompt}]
-    if use_image:
-        blocks.insert(0, {"type": "image", "source": {"type": "url", "url": thumb_url}})
 
-    try:
-        raw = ask_claude(anthropic_key, blocks, max_tokens=1800)
-    except Exception as e:
-        # If only the image was the problem (e.g. unreachable URL), retry text-only
-        if use_image and anthropic is not None and isinstance(e, anthropic.BadRequestError):
-            use_image = False
-            raw = ask_claude(anthropic_key, blocks[1:], max_tokens=1800)
-        else:
-            raise
+@st.cache_data(ttl=3600, show_spinner=False)
+def review_video(ai: dict, video_id: str, title: str, description: str, tags: str,
+                 thumb_url: str, views: int, likes: int, comments: int, published: str,
+                 avg_views: float, use_thumbnail: bool, watch_video: bool = False) -> dict:
+    """
+    Structured AI review of one video. Tries the richest input first and degrades gracefully:
+    (watch video +) thumbnail -> transcript + thumbnail -> transcript only.
+    """
+    can_watch = bool(watch_video and ai["provider"] == "Gemini")
+    attempts = []
+    if can_watch:
+        attempts.append((True, use_thumbnail))
+    attempts.append((False, use_thumbnail))
+    if use_thumbnail:
+        attempts.append((False, False))
 
-    result = parse_json_reply(raw)
-    result["transcript_used"] = bool(transcript)
-    result["thumbnail_used"] = use_image
-    return result
+    last_err = None
+    for watching, with_img in attempts:
+        transcript = "" if watching else fetch_transcript(video_id)
+        prompt = _review_prompt(title, description, tags, views, likes, comments, published,
+                                avg_views, watching, transcript)
+        try:
+            raw = ask_ai(
+                ai, prompt,
+                image_url=thumb_url if (with_img and thumb_url) else "",
+                video_url=f"https://www.youtube.com/watch?v={video_id}" if watching else "",
+                json_mode=True, max_tokens=1800,
+            )
+            result = parse_json_reply(raw)
+        except Exception as e:
+            if _is_fatal_ai_error(e):
+                raise
+            last_err = e
+            continue
+        result["video_watched"] = watching
+        result["transcript_used"] = bool(transcript)
+        result["thumbnail_used"] = bool(with_img and thumb_url)
+        return result
+    raise last_err
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def analyze_comments(anthropic_key: str, title: str, comments: list) -> dict:
+def analyze_comments(ai: dict, title: str, comments: list) -> dict:
     """Structured sentiment / themes / video-idea analysis of a video's comments."""
     joined = "\n".join(f"- {c}" for c in comments)
     prompt = f"""Analyse the viewer comments on the YouTube video "{title}".
@@ -445,11 +544,11 @@ Return ONLY a JSON object (no markdown fences) with exactly this shape:
   "video_ideas": ["follow-up video ideas implied by the comments"]
 }}
 Sentiment values are percentages that sum to 100. Give 3-5 themes and up to 5 items in each list."""
-    return parse_json_reply(ask_claude(anthropic_key, prompt, max_tokens=1500))
+    return parse_json_reply(ask_ai(ai, prompt, json_mode=True, max_tokens=1500))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def channel_strategy(anthropic_key: str, channel: str, subscribers: int, table_csv: str) -> str:
+def channel_strategy(ai: dict, channel: str, subscribers: int, table_csv: str) -> str:
     """Markdown strategy report from the whole recent-video table."""
     prompt = f"""Channel: {channel} ({subscribers:,} subscribers)
 
@@ -469,7 +568,7 @@ Ideas grounded in the data, each with a one-line reason.
 Observations on upload timing plus 2 experiments worth testing.
 
 Be specific, stay grounded in the numbers, and say so when the sample is too small to conclude anything."""
-    return ask_claude(anthropic_key, prompt, max_tokens=2000)
+    return ask_ai(ai, prompt, max_tokens=2000)
 
 
 def render_review(r: dict):
@@ -489,7 +588,9 @@ def render_review(r: dict):
         st.plotly_chart(fig, use_container_width=True)
 
     notes = []
-    if not r.get("transcript_used"):
+    if r.get("video_watched"):
+        notes.append("the AI watched the video itself")
+    elif not r.get("transcript_used"):
         notes.append("no transcript was available, so hook / structure / CTA were not scored")
     if not r.get("thumbnail_used"):
         notes.append("thumbnail was not analysed")
@@ -807,13 +908,35 @@ channel_input = st.sidebar.text_input(
 
 fetch_btn = st.sidebar.button("🔍 Load Channel", use_container_width=True)
 
-anthropic_input = st.sidebar.text_input(
-    "🤖 Anthropic API Key (for AI features)",
-    type="password",
-    placeholder="sk-ant-...",
-    help="Optional. Enables AI video reviews. You can also set ANTHROPIC_API_KEY in .streamlit/secrets.toml"
+st.sidebar.markdown("---")
+ai_provider = st.sidebar.selectbox(
+    "🤖 AI provider", ["Gemini", "Claude"],
+    help="Gemini has a free tier. Get a key at aistudio.google.com/apikey (no card needed)."
 )
-anthropic_key = resolve_anthropic_key(anthropic_input)
+if ai_provider == "Gemini":
+    _key_input = st.sidebar.text_input(
+        "🔑 Gemini API Key (free)", type="password", placeholder="AIza...",
+        help="Or set GEMINI_API_KEY in .streamlit/secrets.toml"
+    )
+    ai_key = resolve_key(_key_input, "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    with st.sidebar.expander("Model settings"):
+        ai_model = st.text_input(
+            "Gemini model", value=GEMINI_DEFAULT_MODEL,
+            help="Any model ID from ai.google.dev/gemini-api/docs/models. "
+                 "'gemini-flash-latest' always points to the current Flash model."
+        )
+else:
+    _key_input = st.sidebar.text_input(
+        "🔑 Anthropic API Key", type="password", placeholder="sk-ant-...",
+        help="Or set ANTHROPIC_API_KEY in .streamlit/secrets.toml"
+    )
+    ai_key = resolve_key(_key_input, "ANTHROPIC_API_KEY")
+    ai_model = AI_MODEL
+ai_cfg = {
+    "provider": ai_provider,
+    "key": ai_key,
+    "model": (ai_model.strip() or GEMINI_DEFAULT_MODEL) if ai_provider == "Gemini" else AI_MODEL,
+}
 
 st.sidebar.markdown("---")
 
@@ -1116,10 +1239,10 @@ elif page == "AI Insights":
     elif "VideoID" not in video_df.columns:
         st.warning("Your loaded data is from an older version of the app. Click **Load Channel** again to refresh it.")
     else:
-        if not anthropic_key:
+        if not ai_cfg["key"]:
             st.warning(
-                "Add an Anthropic API key in the sidebar (or set `ANTHROPIC_API_KEY` in "
-                "`.streamlit/secrets.toml`) to enable the AI tabs. The **Quick Rules** tab works without it."
+                f"Add a {ai_cfg['provider']} API key in the sidebar (or in `.streamlit/secrets.toml`) "
+                "to enable the AI tabs. The **Quick Rules** tab works without it."
             )
 
         tab_video, tab_comments, tab_strategy, tab_rules = st.tabs(
@@ -1145,24 +1268,30 @@ elif page == "AI Insights":
                 m2.metric("Likes", f"{row['Likes']:,}")
                 m3.metric("Comments", f"{row['Comments']:,}")
                 use_thumb = st.checkbox("Include thumbnail analysis", value=True, key="rev_thumb")
+                watch = False
+                if ai_cfg["provider"] == "Gemini":
+                    watch = st.checkbox(
+                        "Let Gemini watch the video (audio + visuals)", value=True, key="rev_watch",
+                        help="Public videos only. Gemini's free tier allows up to 8 hours of YouTube video per day. "
+                             "Falls back to transcript + metadata automatically if it can't watch.")
 
             if st.button("🤖 Review this video", key="rev_btn"):
-                if not anthropic_key:
-                    st.error("Add your Anthropic API key in the sidebar first.")
+                if not ai_cfg["key"]:
+                    st.error(f"Add your {ai_cfg['provider']} API key in the sidebar first.")
                 else:
                     with st.spinner("Fetching transcript and reviewing…"):
                         try:
                             result = review_video(
-                                anthropic_key, row["VideoID"], row["FullTitle"], row["Description"],
+                                ai_cfg, row["VideoID"], row["FullTitle"], row["Description"],
                                 row["Tags"], row["ThumbnailURL"], int(row["Views"]), int(row["Likes"]),
                                 int(row["Comments"]), row["Published"], float(video_df["Views"].mean()),
-                                use_thumb,
+                                use_thumb, watch,
                             )
                             st.session_state.setdefault("ai_reviews", {})[row["VideoID"]] = {
                                 "title": row["FullTitle"], **result
                             }
                         except Exception as e:
-                            st.error(f"AI review failed: {e}")
+                            st.error(f"AI review failed: {friendly_ai_error(e)}")
 
             saved = st.session_state.get("ai_reviews", {}).get(row["VideoID"])
             if saved:
@@ -1181,8 +1310,8 @@ elif page == "AI Insights":
             n_comments = st.slider("Comments to analyse (most relevant first)", 20, 100, 100, step=10, key="com_n")
 
             if st.button("💬 Analyse comments", key="com_btn"):
-                if not anthropic_key:
-                    st.error("Add your Anthropic API key in the sidebar first.")
+                if not ai_cfg["key"]:
+                    st.error(f"Add your {ai_cfg['provider']} API key in the sidebar first.")
                 else:
                     with st.spinner("Fetching and analysing comments…"):
                         comments, err = fetch_comments(stored_api_key, crow["VideoID"], n_comments)
@@ -1192,10 +1321,10 @@ elif page == "AI Insights":
                             st.warning("No comments found on this video.")
                         else:
                             try:
-                                res = analyze_comments(anthropic_key, crow["FullTitle"], comments)
+                                res = analyze_comments(ai_cfg, crow["FullTitle"], comments)
                                 st.session_state["comment_result"] = (crow["VideoID"], len(comments), res)
                             except Exception as e:
-                                st.error(f"Comment analysis failed: {e}")
+                                st.error(f"Comment analysis failed: {friendly_ai_error(e)}")
 
             cached = st.session_state.get("comment_result")
             if cached and cached[0] == crow["VideoID"]:
@@ -1231,17 +1360,17 @@ elif page == "AI Insights":
         with tab_strategy:
             st.caption("Looks across all loaded videos for patterns in what performs and what doesn't.")
             if st.button("🧠 Generate strategy report", key="strat_btn"):
-                if not anthropic_key:
-                    st.error("Add your Anthropic API key in the sidebar first.")
+                if not ai_cfg["key"]:
+                    st.error(f"Add your {ai_cfg['provider']} API key in the sidebar first.")
                 else:
                     with st.spinner("Analysing your channel…"):
                         try:
                             table_csv = video_df[["FullTitle", "Published", "Views", "Likes", "Comments"]].rename(
                                 columns={"FullTitle": "Title"}).to_csv(index=False)
                             st.session_state["strategy_md"] = channel_strategy(
-                                anthropic_key, stats["title"], stats["subscribers"], table_csv)
+                                ai_cfg, stats["title"], stats["subscribers"], table_csv)
                         except Exception as e:
-                            st.error(f"Strategy report failed: {e}")
+                            st.error(f"Strategy report failed: {friendly_ai_error(e)}")
             if st.session_state.get("strategy_md"):
                 st.markdown("---")
                 st.markdown(st.session_state["strategy_md"])
