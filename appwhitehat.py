@@ -272,6 +272,8 @@ HIDDEN_COLS = ["VideoID", "FullTitle", "Description", "Tags", "ThumbnailURL"]
 
 
 GEMINI_DEFAULT_MODEL = "gemini-flash-latest"   # alias that always points at the current Flash model
+GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"     # text-only model available on Groq's free tier
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 def resolve_key(sidebar_value: str, *names: str) -> str:
@@ -333,11 +335,43 @@ def ask_gemini(key: str, model: str, prompt: str, image_url: str = "",
     return resp.text or ""
 
 
+def ask_groq(key: str, model: str, prompt: str, json_mode: bool = False, max_tokens: int = 3000) -> str:
+    """Groq's OpenAI-compatible chat endpoint, called with plain requests (no extra package)."""
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": AI_SYSTEM}, {"role": "user", "content": prompt}],
+        # reasoning models spend part of this budget on hidden thinking, so keep it generous
+        "max_completion_tokens": max(max_tokens, 3000),
+    }
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"        # faster and saves free-tier tokens
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+
+    def call(b):
+        return requests.post(GROQ_URL, headers={"Authorization": f"Bearer {key}"}, json=b, timeout=90)
+
+    r = call(body)
+    if r.status_code == 400 and json_mode:      # model may not support JSON mode: retry without it
+        body.pop("response_format")
+        r = call(body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq API error {r.status_code}: {r.text[:300]}")
+    return r.json()["choices"][0]["message"].get("content") or ""
+
+
+def supports_images(ai: dict) -> bool:
+    """Gemini and Claude accept the thumbnail; Groq's default model is text-only."""
+    return ai["provider"] in ("Gemini", "Claude")
+
+
 def ask_ai(ai: dict, prompt: str, image_url: str = "", video_url: str = "",
            json_mode: bool = False, max_tokens: int = 1800) -> str:
-    """Provider-agnostic entry point. `ai` = {"provider", "key", "model"}."""
+    """Provider-agnostic entry point. `ai` = {"provider": "Gemini"|"Groq"|"Claude", "key", "model"}."""
     if ai["provider"] == "Gemini":
         return ask_gemini(ai["key"], ai["model"], prompt, image_url, video_url, json_mode)
+    if ai["provider"] == "Groq":
+        return ask_groq(ai["key"], ai["model"], prompt, json_mode, max_tokens)   # text-only
     blocks = [{"type": "text", "text": prompt}]
     if image_url:
         blocks.insert(0, {"type": "image", "source": {"type": "url", "url": image_url}})
@@ -345,7 +379,7 @@ def ask_ai(ai: dict, prompt: str, image_url: str = "", video_url: str = "",
 
 
 _FATAL_MARKERS = ("429", "resource_exhausted", "quota", "rate limit", "rate_limit",
-                  "api key", "api_key", "authentication", "401", "not installed")
+                  "api key", "api_key", "authentication", "401", "413", "tokens per minute", "not installed")
 
 
 def _is_fatal_ai_error(e: Exception) -> bool:
@@ -357,11 +391,14 @@ def _is_fatal_ai_error(e: Exception) -> bool:
 def friendly_ai_error(e: Exception) -> str:
     msg = str(e)
     low = msg.lower()
+    if "413" in low or "request too large" in low:
+        return ("The request is too large for this provider's free per-minute token limit. "
+                "Try fewer comments, or switch to Gemini, which has a much larger context.")
     if "429" in low or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
-        return ("Rate/quota limit reached. On Gemini's free tier, per-minute limits clear after a short "
-                "wait and daily limits reset at midnight Pacific. Try again later, or pick a lighter model "
-                "(e.g. a Flash-Lite model) under 'Model settings'.")
-    if "api key" in low or "api_key" in low or "401" in low or "authentication" in low:
+        return ("Rate/quota limit reached. Free tiers have per-minute and per-day limits: wait a minute "
+                "and retry, or try again tomorrow. You can also switch provider (or pick a lighter model "
+                "under 'Model settings') to keep going.")
+    if "api key" in low or "api_key" in low or "401" in low or "authentication" in low or "invalid_api_key" in low:
         return "The API key was rejected. Check that you pasted the whole key for the selected provider."
     return msg[:400]
 
@@ -492,6 +529,9 @@ def review_video(ai: dict, video_id: str, title: str, description: str, tags: st
     (watch video +) thumbnail -> transcript + thumbnail -> transcript only.
     """
     can_watch = bool(watch_video and ai["provider"] == "Gemini")
+    use_thumbnail = bool(use_thumbnail and supports_images(ai))
+    # Groq's free tier has a small per-minute token budget, so send less transcript
+    transcript_cap = 12000 if ai["provider"] == "Groq" else 30000
     attempts = []
     if can_watch:
         attempts.append((True, use_thumbnail))
@@ -501,7 +541,7 @@ def review_video(ai: dict, video_id: str, title: str, description: str, tags: st
 
     last_err = None
     for watching, with_img in attempts:
-        transcript = "" if watching else fetch_transcript(video_id)
+        transcript = "" if watching else fetch_transcript(video_id, transcript_cap)
         prompt = _review_prompt(title, description, tags, views, likes, comments, published,
                                 avg_views, watching, transcript)
         try:
@@ -527,6 +567,8 @@ def review_video(ai: dict, video_id: str, title: str, description: str, tags: st
 @st.cache_data(ttl=3600, show_spinner=False)
 def analyze_comments(ai: dict, title: str, comments: list) -> dict:
     """Structured sentiment / themes / video-idea analysis of a video's comments."""
+    if ai["provider"] == "Groq":
+        comments = comments[:40]   # stay inside Groq's free per-minute token limit
     joined = "\n".join(f"- {c}" for c in comments)
     prompt = f"""Analyse the viewer comments on the YouTube video "{title}".
 
@@ -910,33 +952,30 @@ fetch_btn = st.sidebar.button("🔍 Load Channel", use_container_width=True)
 
 st.sidebar.markdown("---")
 ai_provider = st.sidebar.selectbox(
-    "🤖 AI provider", ["Gemini", "Claude"],
-    help="Gemini has a free tier. Get a key at aistudio.google.com/apikey (no card needed)."
+    "🤖 AI provider", ["Gemini", "Groq", "Claude"],
+    help="Gemini and Groq both have free tiers. Gemini can also watch the video itself."
 )
-if ai_provider == "Gemini":
-    _key_input = st.sidebar.text_input(
-        "🔑 Gemini API Key (free)", type="password", placeholder="AIza...",
-        help="Or set GEMINI_API_KEY in .streamlit/secrets.toml"
-    )
-    ai_key = resolve_key(_key_input, "GEMINI_API_KEY", "GOOGLE_API_KEY")
-    with st.sidebar.expander("Model settings"):
-        ai_model = st.text_input(
-            "Gemini model", value=GEMINI_DEFAULT_MODEL,
-            help="Any model ID from ai.google.dev/gemini-api/docs/models. "
-                 "'gemini-flash-latest' always points to the current Flash model."
-        )
-else:
-    _key_input = st.sidebar.text_input(
-        "🔑 Anthropic API Key", type="password", placeholder="sk-ant-...",
-        help="Or set ANTHROPIC_API_KEY in .streamlit/secrets.toml"
-    )
-    ai_key = resolve_key(_key_input, "ANTHROPIC_API_KEY")
-    ai_model = AI_MODEL
-ai_cfg = {
-    "provider": ai_provider,
-    "key": ai_key,
-    "model": (ai_model.strip() or GEMINI_DEFAULT_MODEL) if ai_provider == "Gemini" else AI_MODEL,
+_PROVIDER_UI = {
+    # provider: (key label, placeholder, secret/env names, default model, where to get a key)
+    "Gemini": ("🔑 Gemini API Key (free)", "AQ.Ab... (or AIza...)", ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+               GEMINI_DEFAULT_MODEL, "aistudio.google.com/apikey"),
+    "Groq":   ("🔑 Groq API Key (free)", "gsk_...", ["GROQ_API_KEY"],
+               GROQ_DEFAULT_MODEL, "console.groq.com/keys"),
+    "Claude": ("🔑 Anthropic API Key", "sk-ant-...", ["ANTHROPIC_API_KEY"],
+               AI_MODEL, "console.anthropic.com"),
 }
+_label, _placeholder, _secret_names, _default_model, _where = _PROVIDER_UI[ai_provider]
+_key_input = st.sidebar.text_input(
+    _label, type="password", placeholder=_placeholder,
+    help=f"Get a key at {_where}. Or set {_secret_names[0]} in .streamlit/secrets.toml"
+)
+ai_key = resolve_key(_key_input, *_secret_names)
+with st.sidebar.expander("Model settings"):
+    ai_model = st.text_input(
+        f"{ai_provider} model", value=_default_model, key=f"model_{ai_provider}",
+        help="Any valid model ID for this provider. Leave the default unless you hit a 'model not found' error."
+    )
+ai_cfg = {"provider": ai_provider, "key": ai_key, "model": ai_model.strip() or _default_model}
 
 st.sidebar.markdown("---")
 
@@ -1267,7 +1306,11 @@ elif page == "AI Insights":
                 m1.metric("Views", f"{row['Views']:,}")
                 m2.metric("Likes", f"{row['Likes']:,}")
                 m3.metric("Comments", f"{row['Comments']:,}")
-                use_thumb = st.checkbox("Include thumbnail analysis", value=True, key="rev_thumb")
+                img_ok = supports_images(ai_cfg)
+                use_thumb = st.checkbox("Include thumbnail analysis", value=img_ok,
+                                        disabled=not img_ok, key="rev_thumb")
+                if not img_ok:
+                    st.caption("The selected Groq model is text-only, so the thumbnail won't be analysed.")
                 watch = False
                 if ai_cfg["provider"] == "Gemini":
                     watch = st.checkbox(
